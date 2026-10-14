@@ -213,11 +213,12 @@ async function getCompleteWork(client, workId) {
               END
           )
           FROM work_authors wa
-          LEFT JOIN authors a
-            ON a.id = wa.author_id
-          LEFT JOIN author_groups ag
-            ON ag.id = wa.group_id
-          WHERE wa.work_id = w.id
+          JOIN authors a
+              ON a.id = wa.author_id
+            JOIN author_awards aa
+              ON aa.author_id = a.id
+            WHERE wa.work_id = w.id
+              AND aa.title ILIKE '%' || $3::varchar || '%'
         ),
         '[]'::json
       ) AS authors
@@ -296,18 +297,22 @@ export async function getWorks(req, res, next) {
             FROM work_authors wa
             JOIN authors a
               ON a.id = wa.author_id
+            JOIN author_awards aa
+              ON aa.author_id = a.id
             WHERE wa.work_id = w.id
-              AND a.awards ILIKE '%' || $3::varchar || '%'
+              AND aa.title ILIKE '%' || $3::varchar || '%'
           ))
 
         AND ($4::varchar IS NULL
           OR EXISTS (
             SELECT 1
             FROM work_authors wa
-            JOIN authors a
+           JOIN authors a
               ON a.id = wa.author_id
+            JOIN author_awards aa
+              ON aa.author_id = a.id
             WHERE wa.work_id = w.id
-              AND a.full_name = $4
+              AND aa.title ILIKE '%' || $3::varchar || '%'
           ))
 
         AND ($5::varchar IS NULL

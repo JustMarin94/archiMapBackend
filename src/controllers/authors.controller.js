@@ -31,7 +31,10 @@ export async function getAuthors(req, res, next) {
       LEFT JOIN photos p ON p.author_id = a.id
       WHERE 
         ($1::varchar IS NULL OR a.full_name ILIKE '%' || $1::varchar || '%')
-        AND ($4::varchar IS NULL OR a.awards ILIKE '%' || $4::varchar || '%')
+        AND ($4::varchar IS NULL OR EXISTS (
+          SELECT 1 FROM author_awards aa 
+          WHERE aa.author_id = a.id AND aa.title ILIKE '%' || $4::varchar || '%'
+        ))
         AND (
           -- If no work/region/year filters are passed, don't force an EXISTS match, 
           -- allowing authors without works or pictures to show up.
@@ -92,7 +95,12 @@ export async function getAuthorsByID(req, res, next) {
         p.caption,
         p.alt_text,
         p.position,
-        p.created_at AS image_created_at
+        p.created_at AS image_created_at,
+        COALESCE(
+          (SELECT json_agg(json_build_object('id', aa.id, 'title', aa.title, 'year', aa.year, 'description', aa.description))
+           FROM author_awards aa WHERE aa.author_id = a.id),
+          '[]'
+        ) AS awards
       FROM authors a
       LEFT JOIN photos p ON p.author_id = a.id
       WHERE a.id = $1;
@@ -123,71 +131,72 @@ export async function getAuthorsFullNames(req, res, next) {
   }
 }
 
-export async function getAuthorsAwards(req, res, next) {
-  try {
-    const result = await pool.query(`
-      SELECT DISTINCT awards 
-      FROM authors 
-      ORDER BY awards;
-    `);
-    res.json(result.rows.map((row) => row.awards));
-  } catch (error) {
-    next(error);
-  }
-}
-
 /**
  * Create a new author
  */
 export async function createAuthor(req, res, next) {
+  const client = await pool.connect();
   try {
     const {
       full_name,
       birth_year,
       death_year,
       education,
-      awards,
+      awards, // Expected to be an array of award objects or strings
       description,
     } = req.body;
 
-    // Validate required fields based on NOT NULL constraints
     if (!full_name) {
       return res.status(400).json({ error: "full_name is required" });
     }
 
-    const query = `
-      INSERT INTO authors (
-        full_name, 
-        birth_year, 
-        death_year, 
-        education, 
-        awards, 
-        description
-      )
-      VALUES ($1, $2, $3, $4, $5, $6)
+    await client.query("BEGIN");
+
+    // 1. Insert author
+    const authorQuery = `
+      INSERT INTO authors (full_name, birth_year, death_year, education, description)
+      VALUES ($1, $2, $3, $4, $5)
       RETURNING *;
     `;
-
-    const values = [
+    const authorResult = await client.query(authorQuery, [
       full_name,
       birth_year || null,
       death_year || null,
       education || null,
-      awards || null,
       description || null,
-    ];
+    ]);
+    const newAuthor = authorResult.rows[0];
 
-    const result = await pool.query(query, values);
-    res.status(201).json(result.rows[0]);
+    // 2. Insert awards if provided
+    if (awards && Array.isArray(awards)) {
+      for (const award of awards) {
+        const title = typeof award === "string" ? award : award.title;
+        const year = typeof award === "object" ? award.year : null;
+        const desc = typeof award === "object" ? award.description : null;
+
+        if (title && title.trim() !== "") {
+          await client.query(
+            `INSERT INTO author_awards (author_id, title, year, description) VALUES ($1, $2, $3, $4)`,
+            [newAuthor.id, title, year || null, desc || null],
+          );
+        }
+      }
+    }
+
+    await client.query("COMMIT");
+    res.status(201).json(newAuthor);
   } catch (error) {
+    await client.query("ROLLBACK");
     next(error);
+  } finally {
+    client.release();
   }
 }
-
 /**
  * Update an existing author by ID
  */
 export async function updateAuthor(req, res, next) {
+  const client = await pool.connect();
   try {
     const { id } = req.params;
     const {
@@ -197,6 +206,7 @@ export async function updateAuthor(req, res, next) {
       education,
       awards,
       description,
+      photos, // Array of photos coming from the frontend
     } = req.body;
 
     if (!id) {
@@ -204,7 +214,7 @@ export async function updateAuthor(req, res, next) {
     }
 
     // Check if the author exists first
-    const checkExist = await pool.query(
+    const checkExist = await client.query(
       `SELECT id FROM authors WHERE id = $1`,
       [id],
     );
@@ -212,6 +222,10 @@ export async function updateAuthor(req, res, next) {
       return res.status(404).json({ message: "Author not found" });
     }
 
+    // Start transaction to safely update author and sync photos
+    await client.query("BEGIN");
+
+    // 1. Update author details
     const query = `
       UPDATE authors 
       SET 
@@ -236,13 +250,62 @@ export async function updateAuthor(req, res, next) {
       id,
     ];
 
-    const result = await pool.query(query, values);
-    res.json(result.rows[0]);
+    const result = await client.query(query, values);
+    const updatedAuthor = result.rows[0];
+
+    // 2. Handle photos using the unified 'photos' table schema
+    if (photos && Array.isArray(photos)) {
+      // Remove old photos belonging to this author
+      await client.query(`DELETE FROM photos WHERE author_id = $1`, [id]);
+
+      // Insert new photos (keeping work_id and group_id as NULL to satisfy photos_owner_check)
+      for (let i = 0; i < photos.length; i++) {
+        const photo = photos[i];
+        if (photo.url && photo.url.trim() !== "") {
+          await client.query(
+            `INSERT INTO photos (url, caption, alt_text, position, author_id, work_id, group_id) 
+             VALUES ($1, $2, $3, $4, $5, NULL, NULL)`,
+            [
+              photo.url,
+              photo.caption || "",
+              photo.alt_text || "",
+              i, // maps to position column
+              id,
+            ],
+          );
+        }
+      }
+    }
+
+    // 3. Handle awards synchronization
+    if (awards && Array.isArray(awards)) {
+      await client.query(`DELETE FROM author_awards WHERE author_id = $1`, [
+        id,
+      ]);
+
+      for (const award of awards) {
+        const title = typeof award === "string" ? award : award.title;
+        const year = typeof award === "object" ? award.year : null;
+        const desc = typeof award === "object" ? award.description : null;
+
+        if (title && title.trim() !== "") {
+          await client.query(
+            `INSERT INTO author_awards (author_id, title, year, description) VALUES ($1, $2, $3, $4)`,
+            [id, title, year || null, desc || null],
+          );
+        }
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json(updatedAuthor);
   } catch (error) {
+    await client.query("ROLLBACK");
     next(error);
+  } finally {
+    client.release();
   }
 }
-
 /**
  * Delete an author by ID
  * (Note: Foreign keys with ON DELETE CASCADE will handle related work_authors,
@@ -266,6 +329,19 @@ export async function deleteAuthor(req, res, next) {
     }
 
     res.json({ message: "Author successfully deleted", id: result.rows[0].id });
+  } catch (error) {
+    next(error);
+  }
+}
+
+export async function getAuthorsAwards(req, res, next) {
+  try {
+    const result = await pool.query(`
+      SELECT DISTINCT title 
+      FROM author_awards 
+      ORDER BY title;
+    `);
+    res.json(result.rows.map((row) => row.title));
   } catch (error) {
     next(error);
   }
