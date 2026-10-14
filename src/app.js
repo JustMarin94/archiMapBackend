@@ -8,7 +8,10 @@ const app = express();
 
 app.use(
   cors({
-    origin: "http://localhost:5173",
+    origin: [
+      "http://localhost:5173",
+      "https://3994-93-136-134-189.ngrok-free.app",
+    ],
   }),
 );
 

@@ -256,6 +256,15 @@ export async function getWorks(req, res, next) {
         w.*,
 
         COALESCE(
+            (
+              SELECT json_agg(wa.author_id)
+              FROM work_authors wa
+              WHERE wa.work_id = w.id
+            ),
+            '[]'::json
+          ) AS author_ids,
+
+        COALESCE(
           json_agg(
             json_build_object(
               'id', p.id,

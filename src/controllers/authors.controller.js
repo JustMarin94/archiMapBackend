@@ -31,23 +31,28 @@ export async function getAuthors(req, res, next) {
       LEFT JOIN photos p ON p.author_id = a.id
       WHERE 
         ($1::varchar IS NULL OR a.full_name ILIKE '%' || $1::varchar || '%')
-        AND EXISTS (
-          SELECT 1 
-          FROM work_authors wa 
-          JOIN works w ON w.id = wa.work_id 
-          LEFT JOIN author_group_members agm 
-            ON agm.group_id = wa.group_id AND agm.author_id = a.id 
-          WHERE 
-            (wa.author_id = a.id OR agm.author_id IS NOT NULL)
-            AND ($2::varchar IS NULL OR w.title ILIKE '%' || $2::varchar || '%')
-            AND ($3::varchar IS NULL OR w.typology = $3)
-            AND ($4::varchar IS NULL OR a.awards ILIKE '%' || $4::varchar || '%')
-            AND ($5::varchar IS NULL OR w.region = $5)
-            AND (
-              $6::integer IS NULL 
-              OR $7::integer IS NULL 
-              OR (w.year_start <= $7 AND w.year_end >= $6)
-            )
+        AND ($4::varchar IS NULL OR a.awards ILIKE '%' || $4::varchar || '%')
+        AND (
+          -- If no work/region/year filters are passed, don't force an EXISTS match, 
+          -- allowing authors without works or pictures to show up.
+          ($2::varchar IS NULL AND $3::varchar IS NULL AND $5::varchar IS NULL AND $6::integer IS NULL AND $7::integer IS NULL)
+          OR EXISTS (
+            SELECT 1 
+            FROM work_authors wa 
+            JOIN works w ON w.id = wa.work_id 
+            LEFT JOIN author_group_members agm 
+              ON agm.group_id = wa.group_id AND agm.author_id = a.id 
+            WHERE 
+              (wa.author_id = a.id OR agm.author_id IS NOT NULL)
+              AND ($2::varchar IS NULL OR w.title ILIKE '%' || $2::varchar || '%')
+              AND ($3::varchar IS NULL OR w.typology = $3)
+              AND ($5::varchar IS NULL OR w.region = $5)
+              AND (
+                $6::integer IS NULL 
+                OR $7::integer IS NULL 
+                OR (w.year_start <= $7 AND w.year_end >= $6)
+              )
+          )
         )
       ORDER BY a.full_name, p.position;
     `;
