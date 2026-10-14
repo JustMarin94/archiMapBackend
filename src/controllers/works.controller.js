@@ -11,7 +11,6 @@ const WORK_FIELDS = [
   "latitude",
   "longitude",
   "region",
-  "awards",
   "year_start",
   "year_end",
   "postal_code",
@@ -63,12 +62,6 @@ function parseCoordinate(value, fieldName) {
 
 /**
  * Validate the authors array.
- *
- * Each item must contain either:
- *   { author_id, role }
- *
- * OR:
- *   { group_id, role }
  */
 function validateAuthors(authors) {
   if (authors === undefined) {
@@ -132,13 +125,6 @@ function validatePhotos(photos) {
 
 /**
  * Build the complete work response.
- *
- * Returns:
- * {
- *   ...work,
- *   photos: [],
- *   authors: []
- * }
  */
 async function getCompleteWork(client, workId) {
   const query = `
@@ -213,12 +199,11 @@ async function getCompleteWork(client, workId) {
               END
           )
           FROM work_authors wa
-          JOIN authors a
-              ON a.id = wa.author_id
-            JOIN author_awards aa
-              ON aa.author_id = a.id
-            WHERE wa.work_id = w.id
-              AND aa.title ILIKE '%' || $3::varchar || '%'
+          LEFT JOIN authors a
+            ON a.id = wa.author_id
+          LEFT JOIN author_groups ag
+            ON ag.id = wa.group_id
+          WHERE wa.work_id = w.id
         ),
         '[]'::json
       ) AS authors
@@ -234,8 +219,6 @@ async function getCompleteWork(client, workId) {
 
 /**
  * GET /works
- *
- * Existing filtering endpoint.
  */
 export async function getWorks(req, res, next) {
   try {
@@ -307,12 +290,10 @@ export async function getWorks(req, res, next) {
           OR EXISTS (
             SELECT 1
             FROM work_authors wa
-           JOIN authors a
+            JOIN authors a
               ON a.id = wa.author_id
-            JOIN author_awards aa
-              ON aa.author_id = a.id
             WHERE wa.work_id = w.id
-              AND aa.title ILIKE '%' || $3::varchar || '%'
+              AND a.full_name = $4
           ))
 
         AND ($5::varchar IS NULL
@@ -350,9 +331,6 @@ export async function getWorks(req, res, next) {
   }
 }
 
-/**
- * GET /works/titles
- */
 export async function getWorkTitles(req, res, next) {
   try {
     const result = await pool.query(`
@@ -367,9 +345,6 @@ export async function getWorkTitles(req, res, next) {
   }
 }
 
-/**
- * GET /works/regions
- */
 export async function getWorkRegions(req, res, next) {
   try {
     const result = await pool.query(`
@@ -385,9 +360,6 @@ export async function getWorkRegions(req, res, next) {
   }
 }
 
-/**
- * GET /works/typology
- */
 export async function getWorkTypology(req, res, next) {
   try {
     const result = await pool.query(`
@@ -403,9 +375,6 @@ export async function getWorkTypology(req, res, next) {
   }
 }
 
-/**
- * GET /works/year-range
- */
 export async function getWorkYearRange(req, res, next) {
   try {
     const result = await pool.query(`
@@ -421,15 +390,6 @@ export async function getWorkYearRange(req, res, next) {
   }
 }
 
-/**
- * GET /works/:id
- *
- * Returns the work with:
- * - all work fields
- * - photos
- * - individual authors
- * - author groups
- */
 export async function getWorksByID(req, res, next) {
   try {
     const { id } = req.params;
@@ -454,16 +414,6 @@ export async function getWorksByID(req, res, next) {
   }
 }
 
-/**
- * POST /works
- *
- * Creates:
- * 1. works
- * 2. photos belonging to the work
- * 3. work_authors relationships
- *
- * Everything happens in one transaction.
- */
 export async function createWork(req, res, next) {
   const client = await pool.connect();
 
@@ -478,7 +428,6 @@ export async function createWork(req, res, next) {
       latitude,
       longitude,
       region,
-      awards,
       year_start,
       year_end,
       postal_code,
@@ -537,9 +486,6 @@ export async function createWork(req, res, next) {
 
     await client.query("BEGIN");
 
-    /**
-     * Insert work.
-     */
     const workResult = await client.query(
       `
         INSERT INTO works (
@@ -550,7 +496,6 @@ export async function createWork(req, res, next) {
           latitude,
           longitude,
           region,
-          awards,
           year_start,
           year_end,
           postal_code,
@@ -564,7 +509,7 @@ export async function createWork(req, res, next) {
         VALUES (
           $1, $2, $3, $4, $5, $6, $7,
           $8, $9, $10, $11, $12, $13, $14,
-          $15, $16, $17
+          $15, $16
         )
         RETURNING *;
       `,
@@ -576,7 +521,6 @@ export async function createWork(req, res, next) {
         parsedLatitude,
         parsedLongitude,
         region ?? null,
-        awards ?? null,
         parsedYearStart,
         parsedYearEnd,
         postal_code ?? null,
@@ -592,9 +536,6 @@ export async function createWork(req, res, next) {
     const work = workResult.rows[0];
     const workId = work.id;
 
-    /**
-     * Insert photos.
-     */
     if (Array.isArray(photos) && photos.length > 0) {
       for (let index = 0; index < photos.length; index++) {
         const photo = photos[index];
@@ -621,9 +562,6 @@ export async function createWork(req, res, next) {
       }
     }
 
-    /**
-     * Insert author/group relationships.
-     */
     if (Array.isArray(authors) && authors.length > 0) {
       for (const author of authors) {
         await client.query(
@@ -646,9 +584,6 @@ export async function createWork(req, res, next) {
       }
     }
 
-    /**
-     * Fetch complete object before committing.
-     */
     const completeWork = await getCompleteWork(client, workId);
 
     await client.query("COMMIT");
@@ -657,9 +592,6 @@ export async function createWork(req, res, next) {
   } catch (error) {
     await client.query("ROLLBACK");
 
-    /**
-     * PostgreSQL unique violation.
-     */
     if (error.code === "23505") {
       return res.status(409).json({
         error: "A work with these values already exists",
@@ -667,9 +599,6 @@ export async function createWork(req, res, next) {
       });
     }
 
-    /**
-     * PostgreSQL foreign-key violation.
-     */
     if (error.code === "23503") {
       return res.status(400).json({
         error:
@@ -684,20 +613,6 @@ export async function createWork(req, res, next) {
   }
 }
 
-/**
- * PUT /works/:id
- *
- * Updates the work.
- *
- * If `photos` is supplied:
- *   existing work photos are replaced.
- *
- * If `authors` is supplied:
- *   existing work authors/groups are replaced.
- *
- * If either property is omitted:
- *   the existing relationships remain unchanged.
- */
 export async function updateWork(req, res, next) {
   const client = await pool.connect();
 
@@ -768,9 +683,6 @@ export async function updateWork(req, res, next) {
 
     await client.query("BEGIN");
 
-    /**
-     * First check that the work exists.
-     */
     const existing = await client.query(
       `
         SELECT id
@@ -789,11 +701,6 @@ export async function updateWork(req, res, next) {
       });
     }
 
-    /**
-     * Build dynamic UPDATE.
-     *
-     * Only fields supplied by the client are changed.
-     */
     const updateValues = [];
     const updateParts = [];
 
@@ -805,7 +712,6 @@ export async function updateWork(req, res, next) {
       latitude: parsedLatitude,
       longitude: parsedLongitude,
       region: body.region,
-      awards: body.awards,
       year_start: parsedYearStart,
       year_end: parsedYearEnd,
       postal_code: body.postal_code,
@@ -824,9 +730,6 @@ export async function updateWork(req, res, next) {
       }
     }
 
-    /**
-     * Always update updated_at when something in works changes.
-     */
     if (updateParts.length > 0) {
       updateParts.push("updated_at = NOW()");
 
@@ -842,9 +745,6 @@ export async function updateWork(req, res, next) {
       );
     }
 
-    /**
-     * Replace photos if photos was explicitly supplied.
-     */
     if (body.photos !== undefined) {
       await client.query(
         `
@@ -881,9 +781,6 @@ export async function updateWork(req, res, next) {
       }
     }
 
-    /**
-     * Replace authors/groups if authors was explicitly supplied.
-     */
     if (body.authors !== undefined) {
       await client.query(
         `
@@ -916,9 +813,6 @@ export async function updateWork(req, res, next) {
       }
     }
 
-    /**
-     * Return complete updated work.
-     */
     const updatedWork = await getCompleteWork(client, id);
 
     await client.query("COMMIT");
@@ -948,17 +842,6 @@ export async function updateWork(req, res, next) {
   }
 }
 
-/**
- * DELETE /works/:id
- *
- * Because your schema uses ON DELETE CASCADE:
- *
- * works
- *   -> photos
- *   -> work_authors
- *
- * are automatically removed.
- */
 export async function deleteWork(req, res, next) {
   const client = await pool.connect();
 

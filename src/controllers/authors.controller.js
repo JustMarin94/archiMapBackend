@@ -222,10 +222,10 @@ export async function updateAuthor(req, res, next) {
       return res.status(404).json({ message: "Author not found" });
     }
 
-    // Start transaction to safely update author and sync photos
+    // Start transaction
     await client.query("BEGIN");
 
-    // 1. Update author details
+    // 1. Update author details (Removed awards from here)
     const query = `
       UPDATE authors 
       SET 
@@ -233,10 +233,9 @@ export async function updateAuthor(req, res, next) {
         birth_year = COALESCE($2, birth_year),
         death_year = COALESCE($3, death_year),
         education = COALESCE($4, education),
-        awards = COALESCE($5, awards),
-        description = COALESCE($6, description),
+        description = COALESCE($5, description),
         updated_at = NOW()
-      WHERE id = $7
+      WHERE id = $6
       RETURNING *;
     `;
 
@@ -245,40 +244,30 @@ export async function updateAuthor(req, res, next) {
       birth_year !== undefined ? birth_year : null,
       death_year !== undefined ? death_year : null,
       education !== undefined ? education : null,
-      awards !== undefined ? awards : null,
       description !== undefined ? description : null,
       id,
     ];
 
-    const result = await client.query(query, values);
-    const updatedAuthor = result.rows[0];
+    await client.query(query, values);
 
     // 2. Handle photos using the unified 'photos' table schema
-    if (photos && Array.isArray(photos)) {
-      // Remove old photos belonging to this author
+    if (photos !== undefined && Array.isArray(photos)) {
       await client.query(`DELETE FROM photos WHERE author_id = $1`, [id]);
 
-      // Insert new photos (keeping work_id and group_id as NULL to satisfy photos_owner_check)
       for (let i = 0; i < photos.length; i++) {
         const photo = photos[i];
         if (photo.url && photo.url.trim() !== "") {
           await client.query(
             `INSERT INTO photos (url, caption, alt_text, position, author_id, work_id, group_id) 
              VALUES ($1, $2, $3, $4, $5, NULL, NULL)`,
-            [
-              photo.url,
-              photo.caption || "",
-              photo.alt_text || "",
-              i, // maps to position column
-              id,
-            ],
+            [photo.url, photo.caption || "", photo.alt_text || "", i, id],
           );
         }
       }
     }
 
     // 3. Handle awards synchronization
-    if (awards && Array.isArray(awards)) {
+    if (awards !== undefined && Array.isArray(awards)) {
       await client.query(`DELETE FROM author_awards WHERE author_id = $1`, [
         id,
       ]);
@@ -297,8 +286,27 @@ export async function updateAuthor(req, res, next) {
       }
     }
 
+    // 4. Fetch the fully assembled author object (including awards and photos) to return
+    const completeAuthorQuery = `
+      SELECT 
+        a.*,
+        COALESCE(
+          (SELECT json_agg(json_build_object('id', aa.id, 'title', aa.title, 'year', aa.year, 'description', aa.description))
+           FROM author_awards aa WHERE aa.author_id = a.id),
+          '[]'
+        ) AS awards,
+        COALESCE(
+          (SELECT json_agg(json_build_object('id', p.id, 'url', p.url, 'caption', p.caption, 'alt_text', p.alt_text, 'position', p.position))
+           FROM photos p WHERE p.author_id = a.id),
+          '[]'
+        ) AS photos
+      FROM authors a
+      WHERE a.id = $1;
+    `;
+    const finalResult = await client.query(completeAuthorQuery, [id]);
+
     await client.query("COMMIT");
-    res.json(updatedAuthor);
+    res.json(finalResult.rows[0]);
   } catch (error) {
     await client.query("ROLLBACK");
     next(error);
