@@ -1,11 +1,46 @@
-import { pool } from "../db.js";
+import prisma from "../db/prisma.js";
 
+/**
+ * Helper to fetch a complete author with awards and photos
+ */
+async function fetchCompleteAuthor(authorId) {
+  const author = await prisma.authors.findUnique({
+    where: { id: authorId },
+    include: {
+      author_awards: {
+        select: {
+          id: true,
+          title: true,
+          year: true,
+          description: true,
+        },
+      },
+      photos: {
+        orderBy: [
+          { position: { sort: "asc", nulls: "last" } },
+          { created_at: "asc" },
+        ],
+      },
+    },
+  });
+
+  if (!author) return null;
+
+  return {
+    ...author,
+    awards: author.author_awards,
+    author_awards: undefined,
+  };
+}
+
+/**
+ * GET /authors
+ */
 export async function getAuthors(req, res, next) {
   try {
     const { full_name, title, typology, awards, region, yearStart, yearEnd } =
       req.query;
 
-    // Safely parse and validate years to prevent invalid integer queries
     const parsedYearStart = yearStart ? parseInt(yearStart, 10) : null;
     const parsedYearEnd = yearEnd ? parseInt(yearEnd, 10) : null;
 
@@ -18,185 +53,260 @@ export async function getAuthors(req, res, next) {
         .json({ error: "yearStart and yearEnd must be valid numbers" });
     }
 
-    const query = `
-      SELECT 
-        a.*,
-        p.id AS image_id,
-        p.url AS photo_url,
-        p.caption,
-        p.alt_text,
-        p.position,
-        p.created_at AS image_created_at
-      FROM authors a
-      LEFT JOIN photos p ON p.author_id = a.id
-      WHERE 
-        ($1::varchar IS NULL OR a.full_name ILIKE '%' || $1::varchar || '%')
-        AND ($4::varchar IS NULL OR EXISTS (
-          SELECT 1 FROM author_awards aa 
-          WHERE aa.author_id = a.id AND aa.title ILIKE '%' || $4::varchar || '%'
-        ))
-        AND (
-          -- If no work/region/year filters are passed, don't force an EXISTS match, 
-          -- allowing authors without works or pictures to show up.
-          ($2::varchar IS NULL AND $3::varchar IS NULL AND $5::varchar IS NULL AND $6::integer IS NULL AND $7::integer IS NULL)
-          OR EXISTS (
-            SELECT 1 
-            FROM work_authors wa 
-            JOIN works w ON w.id = wa.work_id 
-            LEFT JOIN author_group_members agm 
-              ON agm.group_id = wa.group_id AND agm.author_id = a.id 
-            WHERE 
-              (wa.author_id = a.id OR agm.author_id IS NOT NULL)
-              AND ($2::varchar IS NULL OR w.title ILIKE '%' || $2::varchar || '%')
-              AND ($3::varchar IS NULL OR w.typology = $3)
-              AND ($5::varchar IS NULL OR w.region = $5)
-              AND (
-                $6::integer IS NULL 
-                OR $7::integer IS NULL 
-                OR (w.year_start <= $7 AND w.year_end >= $6)
-              )
-          )
-        )
-      ORDER BY a.full_name, p.position;
-    `;
+    const where = {};
 
-    const values = [
-      full_name || null,
-      title || null,
-      typology || null,
-      awards || null,
-      region || null,
-      parsedYearStart,
-      parsedYearEnd,
-    ];
-
-    const result = await pool.query(query, values);
-    res.json(result.rows);
-  } catch (error) {
-    // Pass error to Express error-handling middleware
-    next(error);
-  }
-}
-
-export async function getAuthorsByID(req, res, next) {
-  try {
-    const { id } = req.params;
-
-    // Optional: Validate if ID is a valid integer or UUID depending on your DB schema
-    if (!id) {
-      return res.status(400).json({ error: "Author ID is required" });
+    if (full_name) {
+      where.full_name = { contains: full_name, mode: "insensitive" };
     }
 
-    const query = `
-      SELECT 
-        a.*,
-        p.id AS image_id,
-        p.url AS photo_url,
-        p.caption,
-        p.alt_text,
-        p.position,
-        p.created_at AS image_created_at,
-        COALESCE(
-          (SELECT json_agg(json_build_object('id', aa.id, 'title', aa.title, 'year', aa.year, 'description', aa.description))
-           FROM author_awards aa WHERE aa.author_id = a.id),
-          '[]'
-        ) AS awards
-      FROM authors a
-      LEFT JOIN photos p ON p.author_id = a.id
-      WHERE a.id = $1;
-    `;
-
-    const result = await pool.query(query, [id]);
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: "Author not found" });
+    if (awards) {
+      where.author_awards = {
+        some: {
+          title: { contains: awards, mode: "insensitive" },
+        },
+      };
     }
 
-    res.json(result.rows[0]);
-  } catch (error) {
-    next(error);
-  }
-}
+    // Check if any work/region/year filter is provided
+    const hasWorkFilters =
+      title ||
+      typology ||
+      region ||
+      (parsedYearStart !== null && parsedYearEnd !== null);
 
-export async function getAuthorsFullNames(req, res, next) {
-  try {
-    const result = await pool.query(`
-      SELECT full_name 
-      FROM authors 
-      ORDER BY full_name;
-    `);
-    res.json(result.rows.map((row) => row.full_name));
+    if (hasWorkFilters) {
+      const workFilter = {};
+      if (title) workFilter.title = { contains: title, mode: "insensitive" };
+      if (typology) workFilter.typology = typology;
+      if (region) workFilter.region = region;
+
+      if (parsedYearStart !== null && parsedYearEnd !== null) {
+        workFilter.year_start = { lte: parsedYearEnd };
+        workFilter.year_end = { gte: parsedYearStart };
+      }
+
+      where.OR = [
+        {
+          work_authors: {
+            some: {
+              works: workFilter,
+            },
+          },
+        },
+        {
+          author_group_members: {
+            some: {
+              author_groups: {
+                work_authors: {
+                  some: {
+                    works: workFilter,
+                  },
+                },
+              },
+            },
+          },
+        },
+      ];
+    }
+
+    const authors = await prisma.authors.findMany({
+      where,
+      include: {
+        photos: {
+          orderBy: [{ position: { sort: "asc", nulls: "last" } }],
+        },
+      },
+      orderBy: { full_name: "asc" },
+    });
+
+    // Flatten to match the previous SQL LEFT JOIN structure (one row per photo or author)
+    const result = [];
+    for (const author of authors) {
+      if (author.photos.length === 0) {
+        result.push({
+          ...author,
+          image_id: null,
+          photo_url: null,
+          caption: null,
+          alt_text: null,
+          position: null,
+          image_created_at: null,
+          photos: undefined,
+        });
+      } else {
+        for (const photo of author.photos) {
+          result.push({
+            ...author,
+            image_id: photo.id,
+            photo_url: photo.url,
+            caption: photo.caption,
+            alt_text: photo.alt_text,
+            position: photo.position,
+            image_created_at: photo.created_at,
+            photos: undefined,
+          });
+        }
+      }
+    }
+
+    res.json(result);
   } catch (error) {
     next(error);
   }
 }
 
 /**
- * Create a new author
+ * GET /authors/:id
+ */
+export async function getAuthorsByID(req, res, next) {
+  try {
+    const { id } = req.params;
+
+    if (!id) {
+      return res.status(400).json({ error: "Author ID is required" });
+    }
+
+    const author = await prisma.authors.findUnique({
+      where: { id },
+      include: {
+        author_awards: {
+          select: {
+            id: true,
+            title: true,
+            year: true,
+            description: true,
+          },
+        },
+        photos: {
+          orderBy: [{ position: { sort: "asc", nulls: "last" } }],
+          take: 1, // Matches primary photo from left join layout if needed, or get all
+        },
+      },
+    });
+
+    if (!author) {
+      return res.status(404).json({ message: "Author not found" });
+    }
+
+    const photo = author.photos[0] || {};
+
+    const responseObj = {
+      ...author,
+      image_id: photo.id || null,
+      photo_url: photo.url || null,
+      caption: photo.caption || null,
+      alt_text: photo.alt_text || null,
+      position: photo.position ?? null,
+      image_created_at: photo.created_at || null,
+      awards: author.author_awards,
+      author_awards: undefined,
+      photos: undefined,
+    };
+
+    res.json(responseObj);
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * GET /authors/full-names
+ */
+export async function getAuthorsFullNames(req, res, next) {
+  try {
+    const authors = await prisma.authors.findMany({
+      select: { full_name: true },
+      orderBy: { full_name: "asc" },
+    });
+
+    res.json(authors.map((row) => row.full_name));
+  } catch (error) {
+    next(error);
+  }
+}
+
+/**
+ * POST /authors
  */
 export async function createAuthor(req, res, next) {
-  const client = await pool.connect();
   try {
     const {
       full_name,
       birth_year,
       death_year,
       education,
-      awards, // Expected to be an array of award objects or strings
+      awards,
       description,
+      photos, // 1. Destructure photos from req.body
     } = req.body;
 
     if (!full_name) {
       return res.status(400).json({ error: "full_name is required" });
     }
 
-    await client.query("BEGIN");
+    // Format awards data for Prisma relation creation
+    const formattedAwards = Array.isArray(awards)
+      ? awards
+          .map((award) => {
+            const title = typeof award === "string" ? award : award?.title;
+            const year = typeof award === "object" ? award?.year : null;
+            const desc = typeof award === "object" ? award?.description : null;
 
-    // 1. Insert author
-    const authorQuery = `
-      INSERT INTO authors (full_name, birth_year, death_year, education, description)
-      VALUES ($1, $2, $3, $4, $5)
-      RETURNING *;
-    `;
-    const authorResult = await client.query(authorQuery, [
-      full_name,
-      birth_year || null,
-      death_year || null,
-      education || null,
-      description || null,
-    ]);
-    const newAuthor = authorResult.rows[0];
+            if (!title || title.trim() === "") return null;
 
-    // 2. Insert awards if provided
-    if (awards && Array.isArray(awards)) {
-      for (const award of awards) {
-        const title = typeof award === "string" ? award : award.title;
-        const year = typeof award === "object" ? award.year : null;
-        const desc = typeof award === "object" ? award.description : null;
+            return {
+              title: title.trim(),
+              year: year ? parseInt(year, 10) : null,
+              description: desc || null,
+            };
+          })
+          .filter(Boolean)
+      : [];
 
-        if (title && title.trim() !== "") {
-          await client.query(
-            `INSERT INTO author_awards (author_id, title, year, description) VALUES ($1, $2, $3, $4)`,
-            [newAuthor.id, title, year || null, desc || null],
-          );
-        }
-      }
-    }
+    // Format photos data for Prisma relation creation
+    const formattedPhotos = Array.isArray(photos)
+      ? photos
+          .map((photo, index) => {
+            if (!photo || !photo.url || photo.url.trim() === "") return null;
 
-    await client.query("COMMIT");
-    res.status(201).json(newAuthor);
+            return {
+              url: photo.url,
+              caption: photo.caption || "",
+              alt_text: photo.alt_text || "",
+              position: photo.position ?? index,
+            };
+          })
+          .filter(Boolean)
+      : [];
+
+    // Create author with nested relations in a single atomic operation
+    const newAuthor = await prisma.authors.create({
+      data: {
+        full_name,
+        birth_year: birth_year ? parseInt(birth_year, 10) : null,
+        death_year: death_year ? parseInt(death_year, 10) : null,
+        education: education || null,
+        description: description || null,
+        author_awards: {
+          create: formattedAwards,
+        },
+        photos: {
+          create: formattedPhotos,
+        },
+      },
+    });
+
+    const completeAuthor = await fetchCompleteAuthor(newAuthor.id);
+    res.status(201).json(completeAuthor);
   } catch (error) {
-    await client.query("ROLLBACK");
     next(error);
-  } finally {
-    client.release();
   }
 }
+
 /**
- * Update an existing author by ID
+ * PUT /authors/:id
  */
 export async function updateAuthor(req, res, next) {
-  const client = await pool.connect();
   try {
     const { id } = req.params;
     const {
@@ -206,118 +316,105 @@ export async function updateAuthor(req, res, next) {
       education,
       awards,
       description,
-      photos, // Array of photos coming from the frontend
+      photos,
     } = req.body;
 
     if (!id) {
       return res.status(400).json({ error: "Author ID is required" });
     }
 
-    // Check if the author exists first
-    const checkExist = await client.query(
-      `SELECT id FROM authors WHERE id = $1`,
-      [id],
-    );
-    if (checkExist.rows.length === 0) {
+    await prisma.$transaction(async (tx) => {
+      const existing = await tx.authors.findUnique({
+        where: { id },
+        select: { id: true },
+      });
+
+      if (!existing) {
+        const err = new Error("Author not found");
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const dataToUpdate = {};
+      if (full_name !== undefined) dataToUpdate.full_name = full_name;
+      if (birth_year !== undefined)
+        dataToUpdate.birth_year = birth_year ? parseInt(birth_year, 10) : null;
+      if (death_year !== undefined)
+        dataToUpdate.death_year = death_year ? parseInt(death_year, 10) : null;
+      if (education !== undefined) dataToUpdate.education = education;
+      if (description !== undefined) dataToUpdate.description = description;
+
+      if (Object.keys(dataToUpdate).length > 0) {
+        dataToUpdate.updated_at = new Date();
+        await tx.authors.update({
+          where: { id },
+          data: dataToUpdate,
+        });
+      }
+
+      if (photos !== undefined && Array.isArray(photos)) {
+        await tx.photos.deleteMany({ where: { author_id: id } });
+
+        if (photos.length > 0) {
+          const photoData = photos
+            .map((photo, index) => {
+              if (!photo.url || photo.url.trim() === "") return null;
+              return {
+                url: photo.url,
+                caption: photo.caption || "",
+                alt_text: photo.alt_text || "",
+                position: photo.position ?? index,
+                author_id: id,
+              };
+            })
+            .filter(Boolean);
+
+          if (photoData.length > 0) {
+            await tx.photos.createMany({ data: photoData });
+          }
+        }
+      }
+
+      if (awards !== undefined && Array.isArray(awards)) {
+        await tx.author_awards.deleteMany({ where: { author_id: id } });
+
+        if (awards.length > 0) {
+          const awardData = awards
+            .map((award) => {
+              const title = typeof award === "string" ? award : award.title;
+              const year = typeof award === "object" ? award.year : null;
+              const desc = typeof award === "object" ? award.description : null;
+
+              if (!title || title.trim() === "") return null;
+
+              return {
+                author_id: id,
+                title: title.trim(),
+                year: year ? parseInt(year, 10) : null,
+                description: desc || null,
+              };
+            })
+            .filter(Boolean);
+
+          if (awardData.length > 0) {
+            await tx.author_awards.createMany({ data: awardData });
+          }
+        }
+      }
+    });
+
+    const updatedAuthor = await fetchCompleteAuthor(id);
+    res.json(updatedAuthor);
+  } catch (error) {
+    if (error.statusCode === 404) {
       return res.status(404).json({ message: "Author not found" });
     }
-
-    // Start transaction
-    await client.query("BEGIN");
-
-    // 1. Update author details (Removed awards from here)
-    const query = `
-      UPDATE authors 
-      SET 
-        full_name = COALESCE($1, full_name),
-        birth_year = COALESCE($2, birth_year),
-        death_year = COALESCE($3, death_year),
-        education = COALESCE($4, education),
-        description = COALESCE($5, description),
-        updated_at = NOW()
-      WHERE id = $6
-      RETURNING *;
-    `;
-
-    const values = [
-      full_name !== undefined ? full_name : null,
-      birth_year !== undefined ? birth_year : null,
-      death_year !== undefined ? death_year : null,
-      education !== undefined ? education : null,
-      description !== undefined ? description : null,
-      id,
-    ];
-
-    await client.query(query, values);
-
-    // 2. Handle photos using the unified 'photos' table schema
-    if (photos !== undefined && Array.isArray(photos)) {
-      await client.query(`DELETE FROM photos WHERE author_id = $1`, [id]);
-
-      for (let i = 0; i < photos.length; i++) {
-        const photo = photos[i];
-        if (photo.url && photo.url.trim() !== "") {
-          await client.query(
-            `INSERT INTO photos (url, caption, alt_text, position, author_id, work_id, group_id) 
-             VALUES ($1, $2, $3, $4, $5, NULL, NULL)`,
-            [photo.url, photo.caption || "", photo.alt_text || "", i, id],
-          );
-        }
-      }
-    }
-
-    // 3. Handle awards synchronization
-    if (awards !== undefined && Array.isArray(awards)) {
-      await client.query(`DELETE FROM author_awards WHERE author_id = $1`, [
-        id,
-      ]);
-
-      for (const award of awards) {
-        const title = typeof award === "string" ? award : award.title;
-        const year = typeof award === "object" ? award.year : null;
-        const desc = typeof award === "object" ? award.description : null;
-
-        if (title && title.trim() !== "") {
-          await client.query(
-            `INSERT INTO author_awards (author_id, title, year, description) VALUES ($1, $2, $3, $4)`,
-            [id, title, year || null, desc || null],
-          );
-        }
-      }
-    }
-
-    // 4. Fetch the fully assembled author object (including awards and photos) to return
-    const completeAuthorQuery = `
-      SELECT 
-        a.*,
-        COALESCE(
-          (SELECT json_agg(json_build_object('id', aa.id, 'title', aa.title, 'year', aa.year, 'description', aa.description))
-           FROM author_awards aa WHERE aa.author_id = a.id),
-          '[]'
-        ) AS awards,
-        COALESCE(
-          (SELECT json_agg(json_build_object('id', p.id, 'url', p.url, 'caption', p.caption, 'alt_text', p.alt_text, 'position', p.position))
-           FROM photos p WHERE p.author_id = a.id),
-          '[]'
-        ) AS photos
-      FROM authors a
-      WHERE a.id = $1;
-    `;
-    const finalResult = await client.query(completeAuthorQuery, [id]);
-
-    await client.query("COMMIT");
-    res.json(finalResult.rows[0]);
-  } catch (error) {
-    await client.query("ROLLBACK");
     next(error);
-  } finally {
-    client.release();
   }
 }
+
 /**
- * Delete an author by ID
- * (Note: Foreign keys with ON DELETE CASCADE will handle related work_authors,
- * author_group_members, and author photos automatically)
+ * DELETE /authors/:id
  */
 export async function deleteAuthor(req, res, next) {
   try {
@@ -327,29 +424,32 @@ export async function deleteAuthor(req, res, next) {
       return res.status(400).json({ error: "Author ID is required" });
     }
 
-    const result = await pool.query(
-      `DELETE FROM authors WHERE id = $1 RETURNING id;`,
-      [id],
-    );
+    const deleted = await prisma.authors.delete({
+      where: { id },
+      select: { id: true },
+    });
 
-    if (result.rows.length === 0) {
+    res.json({ message: "Author successfully deleted", id: deleted.id });
+  } catch (error) {
+    if (error.code === "P2025") {
       return res.status(404).json({ message: "Author not found" });
     }
-
-    res.json({ message: "Author successfully deleted", id: result.rows[0].id });
-  } catch (error) {
     next(error);
   }
 }
 
+/**
+ * GET /authors/awards
+ */
 export async function getAuthorsAwards(req, res, next) {
   try {
-    const result = await pool.query(`
-      SELECT DISTINCT title 
-      FROM author_awards 
-      ORDER BY title;
-    `);
-    res.json(result.rows.map((row) => row.title));
+    const awards = await prisma.author_awards.findMany({
+      select: { title: true },
+      distinct: ["title"],
+      orderBy: { title: "asc" },
+    });
+
+    res.json(awards.map((row) => row.title));
   } catch (error) {
     next(error);
   }
