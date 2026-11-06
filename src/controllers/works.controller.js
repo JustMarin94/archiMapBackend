@@ -1,4 +1,5 @@
 import prisma from "../db/prisma.js";
+import { PhotoLayout } from "../generated/prisma/client.js";
 
 /**
  * Validate year values.
@@ -364,6 +365,7 @@ export async function createWork(req, res, next) {
       status,
       intervention_type,
       legacy_category,
+      photo_layout,
       photos,
       authors,
     } = body;
@@ -372,7 +374,30 @@ export async function createWork(req, res, next) {
       return res.status(400).json({ error: "title is required" });
     }
 
+    if (
+      photo_layout !== undefined &&
+      !Object.values(PhotoLayout).includes(photo_layout)
+    ) {
+      return res.status(400).json({
+        error: "Invalid photo_layout",
+        allowedValues: Object.values(PhotoLayout),
+      });
+    }
+
     validatePhotos(photos);
+
+    if (Array.isArray(photos) && photos.length > 0) {
+      const positions = photos.map((p) => p.position);
+      const uniquePositions = new Set(positions);
+
+      if (positions.length !== uniquePositions.size) {
+        return res.status(400).json({
+          error:
+            "Duplicate photo positions are not allowed. Each picture must have a unique position.",
+        });
+      }
+    }
+
     validateAuthors(authors);
 
     const parsedYearStart = parseYear(year_start, "year_start");
@@ -428,6 +453,7 @@ export async function createWork(req, res, next) {
           status: status ?? null,
           intervention_type: intervention_type ?? null,
           legacy_category: legacy_category ?? null,
+          photo_layout: photo_layout ?? null,
         },
       });
 
@@ -483,6 +509,7 @@ export async function updateWork(req, res, next) {
   try {
     const { id } = req.params;
     const body = req.body || {};
+    const { photos, authors } = body; // Destructure photos and authors for easy reference
 
     if (!id) {
       return res.status(400).json({ error: "Work ID is required" });
@@ -495,8 +522,32 @@ export async function updateWork(req, res, next) {
       return res.status(400).json({ error: "title cannot be empty" });
     }
 
-    validatePhotos(body.photos);
-    validateAuthors(body.authors);
+    if (
+      body.photo_layout !== undefined &&
+      !Object.values(PhotoLayout).includes(body.photo_layout)
+    ) {
+      return res.status(400).json({
+        error: "Invalid photo_layout",
+        allowedValues: Object.values(PhotoLayout),
+      });
+    }
+
+    validatePhotos(photos);
+
+    // FIXED: Use 'photos' (from destructuring) instead of undefined variable
+    if (Array.isArray(photos) && photos.length > 0) {
+      const positions = photos.map((p) => p.position);
+      const uniquePositions = new Set(positions);
+
+      if (positions.length !== uniquePositions.size) {
+        return res.status(400).json({
+          error:
+            "Duplicate photo positions are not allowed. Each picture must have a unique position.",
+        });
+      }
+    }
+
+    validateAuthors(authors);
 
     const parsedYearStart =
       body.year_start !== undefined
@@ -580,6 +631,7 @@ export async function updateWork(req, res, next) {
         status: body.status,
         intervention_type: body.intervention_type,
         legacy_category: body.legacy_category,
+        photo_layout: body.photo_layout,
       };
 
       for (const [key, value] of Object.entries(fieldValues)) {
@@ -597,12 +649,12 @@ export async function updateWork(req, res, next) {
         });
       }
 
-      if (body.photos !== undefined) {
+      if (photos !== undefined) {
         await tx.photos.deleteMany({ where: { work_id: id } });
 
-        if (Array.isArray(body.photos) && body.photos.length > 0) {
+        if (Array.isArray(photos) && photos.length > 0) {
           await tx.photos.createMany({
-            data: body.photos.map((photo, index) => ({
+            data: photos.map((photo, index) => ({
               url: photo.url,
               caption: photo.caption ?? null,
               alt_text: photo.alt_text ?? null,
@@ -613,12 +665,12 @@ export async function updateWork(req, res, next) {
         }
       }
 
-      if (body.authors !== undefined) {
+      if (authors !== undefined) {
         await tx.work_authors.deleteMany({ where: { work_id: id } });
 
-        if (Array.isArray(body.authors) && body.authors.length > 0) {
+        if (Array.isArray(authors) && authors.length > 0) {
           await tx.work_authors.createMany({
-            data: body.authors.map((author) => ({
+            data: authors.map((author) => ({
               work_id: id,
               author_id: author.author_id ?? null,
               group_id: author.group_id ?? null,

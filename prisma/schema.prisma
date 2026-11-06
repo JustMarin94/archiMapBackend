@@ -8,6 +8,12 @@ datasource db {
   provider = "postgresql"
 }
 
+enum PhotoLayout {
+  GRID
+  MOSAIC
+  LIST
+}
+
 model author_awards {
   id          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   author_id   String    @db.Uuid
@@ -107,6 +113,7 @@ model works {
   status            String?
   intervention_type String?
   legacy_category   String?        @db.VarChar(50)
+  photo_layout      PhotoLayout    @default(GRID)
   photos            photos[]
   work_authors      work_authors[]
 }

@@ -115,6 +115,7 @@ export async function getAuthors(req, res, next) {
         photos: {
           orderBy: [{ position: { sort: "asc", nulls: "last" } }],
         },
+        author_awards: true,
       },
       orderBy: { full_name: "asc" },
     });
@@ -122,9 +123,13 @@ export async function getAuthors(req, res, next) {
     // Flatten to match the previous SQL LEFT JOIN structure (one row per photo or author)
     const result = [];
     for (const author of authors) {
-      if (author.photos.length === 0) {
+      // Destructure photos and author_awards so they are scoped correctly
+      const { photos, author_awards, ...authorData } = author;
+
+      if (photos.length === 0) {
         result.push({
-          ...author,
+          ...authorData,
+          author_awards,
           image_id: null,
           photo_url: null,
           caption: null,
@@ -134,9 +139,10 @@ export async function getAuthors(req, res, next) {
           photos: undefined,
         });
       } else {
-        for (const photo of author.photos) {
+        for (const photo of photos) {
           result.push({
-            ...author,
+            ...authorData,
+            author_awards,
             image_id: photo.id,
             photo_url: photo.url,
             caption: photo.caption,
@@ -179,7 +185,19 @@ export async function getAuthorsByID(req, res, next) {
         },
         photos: {
           orderBy: [{ position: { sort: "asc", nulls: "last" } }],
-          take: 1, // Matches primary photo from left join layout if needed, or get all
+          take: 1,
+        },
+        work_authors: {
+          include: {
+            works: {
+              include: {
+                photos: {
+                  orderBy: [{ position: { sort: "asc", nulls: "last" } }],
+                  take: 1,
+                },
+              },
+            },
+          },
         },
       },
     });
@@ -190,6 +208,22 @@ export async function getAuthorsByID(req, res, next) {
 
     const photo = author.photos[0] || {};
 
+    // Map work_authors to a clean works array with IDs and details
+    const works = author.work_authors.map((wa) => {
+      const work = wa.works;
+      const workPhoto = work?.photos?.[0] || {};
+      return {
+        id: work?.id, // work id
+        title: work?.title,
+        typology: work?.typology,
+        city: work?.city,
+        year_start: work?.year_start,
+        year_end: work?.year_end,
+        role: wa.role, // author's role on this specific work
+        photo_url: workPhoto.url || null,
+      };
+    });
+
     const responseObj = {
       ...author,
       image_id: photo.id || null,
@@ -199,7 +233,9 @@ export async function getAuthorsByID(req, res, next) {
       position: photo.position ?? null,
       image_created_at: photo.created_at || null,
       awards: author.author_awards,
+      works: works, // <--- Added works array here
       author_awards: undefined,
+      work_authors: undefined,
       photos: undefined,
     };
 

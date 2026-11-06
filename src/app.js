@@ -12,7 +12,7 @@ app.use(
   cors({
     origin: [
       "http://localhost:5173",
-      "https://637a-2a05-4f44-30d-9100-8183-7b2d-d5b5-14bc.ngrok-free.app",
+      "https://779c-2a05-4f44-30d-9100-1134-98f3-596-3bd1.ngrok-free.app",
     ],
   }),
 );
