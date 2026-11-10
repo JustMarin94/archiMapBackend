@@ -11,12 +11,13 @@ async function fetchCompleteAuthor(authorId) {
         select: {
           id: true,
           title: true,
+          title_en: true,
           year: true,
-          description: true,
         },
       },
       photos: {
         orderBy: [
+          { is_main: "desc" },
           { position: { sort: "asc", nulls: "last" } },
           { created_at: "asc" },
         ],
@@ -180,7 +181,7 @@ export async function getAuthorsByID(req, res, next) {
             id: true,
             title: true,
             year: true,
-            description: true,
+            title_en: true,
           },
         },
         photos: {
@@ -286,21 +287,29 @@ export async function createAuthor(req, res, next) {
           .map((award) => {
             const title = typeof award === "string" ? award : award?.title;
             const year = typeof award === "object" ? award?.year : null;
-            const desc = typeof award === "object" ? award?.description : null;
 
             if (!title || title.trim() === "") return null;
 
             return {
               title: title.trim(),
               year: year ? parseInt(year, 10) : null,
-              description: desc || null,
             };
           })
           .filter(Boolean)
       : [];
 
+    // === PLACE SAFETY CHECK HERE FOR CREATE ===
+    let foundMainCreate = false;
+    const safePhotos = Array.isArray(photos)
+      ? photos.map((photo) => {
+          const isMain = Boolean(photo?.is_main) && !foundMainCreate;
+          if (isMain) foundMainCreate = true;
+          return { ...photo, is_main: isMain };
+        })
+      : [];
+
     // Format photos data for Prisma relation creation
-    const formattedPhotos = Array.isArray(photos)
+    const formattedPhotos = safePhotos
       ? photos
           .map((photo, index) => {
             if (!photo || !photo.url || photo.url.trim() === "") return null;
@@ -310,6 +319,7 @@ export async function createAuthor(req, res, next) {
               caption: photo.caption || "",
               alt_text: photo.alt_text || "",
               position: photo.position ?? index,
+              is_main: photo.is_main,
             };
           })
           .filter(Boolean)
@@ -392,7 +402,17 @@ export async function updateAuthor(req, res, next) {
         await tx.photos.deleteMany({ where: { author_id: id } });
 
         if (photos.length > 0) {
-          const photoData = photos
+          // === PLACE SAFETY CHECK HERE FOR CREATE ===
+          let foundMainCreate = false;
+          const safePhotos = Array.isArray(photos)
+            ? photos.map((photo) => {
+                const isMain = Boolean(photo?.is_main) && !foundMainCreate;
+                if (isMain) foundMainCreate = true;
+                return { ...photo, is_main: isMain };
+              })
+            : [];
+
+          const photoData = safePhotos
             .map((photo, index) => {
               if (!photo.url || photo.url.trim() === "") return null;
               return {
@@ -400,6 +420,7 @@ export async function updateAuthor(req, res, next) {
                 caption: photo.caption || "",
                 alt_text: photo.alt_text || "",
                 position: photo.position ?? index,
+                is_main: photo.is_main,
                 author_id: id,
               };
             })
@@ -419,7 +440,6 @@ export async function updateAuthor(req, res, next) {
             .map((award) => {
               const title = typeof award === "string" ? award : award.title;
               const year = typeof award === "object" ? award.year : null;
-              const desc = typeof award === "object" ? award.description : null;
 
               if (!title || title.trim() === "") return null;
 

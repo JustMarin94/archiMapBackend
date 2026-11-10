@@ -111,6 +111,7 @@ export async function getCompleteWork(workId) {
     include: {
       photos: {
         orderBy: [
+          { is_main: "desc" }, // <--- 1. Prioritize is_main photo
           { position: { sort: "asc", nulls: "last" } },
           { created_at: "asc" },
         ],
@@ -121,6 +122,7 @@ export async function getCompleteWork(workId) {
             include: {
               photos: {
                 orderBy: [
+                  { is_main: "desc" }, // <--- Prioritize author's main photo too
                   { position: { sort: "asc", nulls: "last" } },
                   { created_at: "asc" },
                 ],
@@ -132,6 +134,7 @@ export async function getCompleteWork(workId) {
             include: {
               photos: {
                 orderBy: [
+                  { is_main: "desc" },
                   { position: { sort: "asc", nulls: "last" } },
                   { created_at: "asc" },
                 ],
@@ -235,7 +238,10 @@ export async function getWorks(req, res, next) {
       where,
       include: {
         photos: {
-          orderBy: [{ position: { sort: "asc", nulls: "last" } }],
+          orderBy: [
+            { is_main: "desc" },
+            { position: { sort: "asc", nulls: "last" } },
+          ],
         },
         work_authors: {
           select: {
@@ -434,6 +440,16 @@ export async function createWork(req, res, next) {
         .json({ error: "longitude must be between -180 and 180" });
     }
 
+    // === 2. SAFE PHOTOS CHECK FOR CREATE (Ensures only one is_main = true) ===
+    let foundMainCreate = false;
+    const safePhotos = Array.isArray(photos)
+      ? photos.map((photo) => {
+          const isMain = Boolean(photo?.is_main) && !foundMainCreate;
+          if (isMain) foundMainCreate = true;
+          return { ...photo, is_main: isMain };
+        })
+      : [];
+
     const work = await prisma.$transaction(async (tx) => {
       const newWork = await tx.works.create({
         data: {
@@ -457,13 +473,14 @@ export async function createWork(req, res, next) {
         },
       });
 
-      if (Array.isArray(photos) && photos.length > 0) {
+      if (safePhotos.length > 0) {
         await tx.photos.createMany({
-          data: photos.map((photo, index) => ({
+          data: safePhotos.map((photo, index) => ({
             url: photo.url,
             caption: photo.caption ?? null,
             alt_text: photo.alt_text ?? null,
             position: photo.position ?? index,
+            is_main: photo.is_main, // <--- Include evaluated is_main flag
             work_id: newWork.id,
           })),
         });
@@ -509,7 +526,7 @@ export async function updateWork(req, res, next) {
   try {
     const { id } = req.params;
     const body = req.body || {};
-    const { photos, authors } = body; // Destructure photos and authors for easy reference
+    const { photos, authors } = body;
 
     if (!id) {
       return res.status(400).json({ error: "Work ID is required" });
@@ -534,7 +551,6 @@ export async function updateWork(req, res, next) {
 
     validatePhotos(photos);
 
-    // FIXED: Use 'photos' (from destructuring) instead of undefined variable
     if (Array.isArray(photos) && photos.length > 0) {
       const positions = photos.map((p) => p.position);
       const uniquePositions = new Set(positions);
@@ -653,12 +669,21 @@ export async function updateWork(req, res, next) {
         await tx.photos.deleteMany({ where: { work_id: id } });
 
         if (Array.isArray(photos) && photos.length > 0) {
+          // === 3. SAFE PHOTOS CHECK FOR UPDATE ===
+          let foundMainUpdate = false;
+          const safePhotos = photos.map((photo) => {
+            const isMain = Boolean(photo?.is_main) && !foundMainUpdate;
+            if (isMain) foundMainUpdate = true;
+            return { ...photo, is_main: isMain };
+          });
+
           await tx.photos.createMany({
-            data: photos.map((photo, index) => ({
+            data: safePhotos.map((photo, index) => ({
               url: photo.url,
               caption: photo.caption ?? null,
               alt_text: photo.alt_text ?? null,
               position: photo.position ?? index,
+              is_main: photo.is_main, // <--- Include evaluated is_main flag
               work_id: id,
             })),
           });
